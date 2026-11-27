@@ -298,6 +298,11 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             if "@" in netloc:
                 userpass, _, netloc = netloc.rpartition("@")
             host, port = httputil.split_host_and_port(netloc)
+            if not host:
+                raise ValueError("No host in url: %s" % self.request.url)
+            if port is not None and port > 65535:
+                # getaddrinfo would quietly wrap the port around.
+                raise ValueError("Port out of range in url: %s" % self.request.url)
             if port is None:
                 port = 443 if self.parsed.scheme == "https" else 80
             if re.match(r"^\[.*\]$", host):
@@ -633,6 +638,42 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             new_request.url = urllib.parse.urljoin(
                 self.request.url, self.headers["Location"]
             )
+            new_request.headers = self.request.headers.copy()
+            parsed_orig_url = urllib.parse.urlsplit(original_request.url)
+            parsed_new_url = urllib.parse.urlsplit(new_request.url)
+            if (
+                parsed_orig_url.scheme != parsed_new_url.scheme
+                or parsed_orig_url.netloc != parsed_new_url.netloc
+            ):
+                # Cross-origin redirect: strip auth headers.
+                # Note that while there is no formal specification of headers that should be
+                # stripped here, libcurl strips the Authorization and Cookie headers, so we
+                # do the same.
+                # Reference:
+                # https://github.com/curl/curl/blob/01d8191b25a05e8fa91553a6c0d48acb99907d26/lib/http.c#L1827-L1828
+                #
+                # Note that checking for cross-origin redirects is a crude heuristic. It is both
+                # too weak (e.g. cookies that have a path attribute may need to be stripped even on
+                # same-origin redirects) and too strong (e.g. cookies may be kept on cross-host
+                # redirects within the same domain). However, we cannot know the full details of
+                # the cookie policy at this layer, so we use the same heuristic as libcurl.
+                # Applications that need more control over behavior on redirects can set
+                # follow_redirects=False and handle 3xx responses themselves.
+                new_request.auth_username = None
+                new_request.auth_password = None
+                if "@" in parsed_new_url.netloc:
+                    # Strip the userinfo. This keeps the rest of the netloc
+                    # as it was (unlike rebuilding it from the hostname and
+                    # port, which would drop an IPv6 address's brackets).
+                    # The port is checked when the new request starts.
+                    new_netloc = parsed_new_url.netloc.rpartition("@")[2]
+                    parsed_new_url = parsed_new_url._replace(netloc=new_netloc)
+                new_request.url = urllib.parse.urlunsplit(parsed_new_url)
+                for h in ["Authorization", "Cookie"]:
+                    try:
+                        del new_request.headers[h]
+                    except KeyError:
+                        pass
             assert self.request.max_redirects is not None
             new_request.max_redirects = self.request.max_redirects - 1
             del new_request.headers["Host"]
@@ -657,7 +698,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                     "Transfer-Encoding",
                 ]:
                     try:
-                        del self.request.headers[h]
+                        del new_request.headers[h]
                     except KeyError:
                         pass
             new_request.original_request = original_request  # type: ignore

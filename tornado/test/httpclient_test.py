@@ -13,9 +13,10 @@ import typing  # noqa: F401
 import unicodedata
 import unittest
 
-from tornado.escape import utf8, native_str, to_unicode
+from tornado.escape import utf8, native_str, to_unicode, json_encode, json_decode
 from tornado import gen
 from tornado.httpclient import (
+    AsyncHTTPClient,
     HTTPRequest,
     HTTPResponse,
     _RequestProxy,
@@ -27,7 +28,13 @@ from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
 from tornado.log import gen_log, app_log
 from tornado import netutil
-from tornado.testing import AsyncHTTPTestCase, bind_unused_port, gen_test, ExpectLog
+from tornado.testing import (
+    AsyncHTTPTestCase,
+    AsyncTestCase,
+    bind_unused_port,
+    gen_test,
+    ExpectLog,
+)
 from tornado.test.util import skipOnTravis, ignore_deprecation
 from tornado.web import Application, RequestHandler, url
 from tornado.httputil import format_timestamp, HTTPHeaders
@@ -156,6 +163,11 @@ class HeaderEncodingHandler(RequestHandler):
         self.finish(self.request.headers["Foo"].encode("ISO8859-1"))
 
 
+class EchoHeadersHandler(RequestHandler):
+    def get(self):
+        self.write(json_encode(dict(self.request.headers.get_all())))
+
+
 # These tests end up getting run redundantly: once here with the default
 # HTTPClient implementation, and then again in each implementation's own
 # test suite.
@@ -181,9 +193,22 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
                 url("/set_header", SetHeaderHandler),
                 url("/invalid_gzip", InvalidGzipHandler),
                 url("/header-encoding", HeaderEncodingHandler),
+                url("/echo_headers", EchoHeadersHandler),
             ],
             gzip=True,
         )
+
+    def setUp(self):
+        super().setUp()
+
+        # Add a second port (serving the same app) to the HTTP server, so we can test the effects
+        # of redirects that span different origins.
+        sock, port = bind_unused_port()
+        self.http_server.add_socket(sock)
+        self.__port2 = port
+
+    def get_url2(self, path: str) -> str:
+        return f"{self.get_protocol()}://127.0.0.1:{self.__port2}{path}"
 
     def test_patch_receives_payload(self):
         body = b"some patch data"
@@ -494,6 +519,17 @@ Transfer-Encoding: chunked
         finally:
             client.close()
 
+    def test_configure_defaults_disallowed(self):
+        for defaults in [
+            dict(auth_username="me"),
+            dict(auth_password="secret"),
+            dict(auth_username="me", auth_password="secret"),
+            dict(headers={"Authorization": "secret"}),
+        ]:
+            with self.subTest(defaults=defaults):
+                with self.assertRaises(ValueError):
+                    self.http_client.__class__(force_instance=True, defaults=defaults)
+
     def test_header_types(self):
         # Header values may be passed as character or utf8 byte strings,
         # in a plain dictionary or an HTTPHeaders object.
@@ -740,6 +776,76 @@ X-XSS-Protection: 1;
             with self.subTest(name=name, position="key"):
                 with self.assertRaises(ValueError):
                     self.fetch("/hello", headers={header: "foo"})
+
+    def test_strip_headers_on_redirect(self):
+        # Ensure that headers that should be stripped on cross-origin redirects
+        # are stripped, even if the redirect is to a different port on localhost.
+        test_cases: typing.List[typing.Tuple[str, typing.Dict, str]] = [
+            ("manual auth header", dict(headers={"Authorization": "secret"}), ""),
+            ("credentials in URL", dict(), "me:secret"),
+            ("auth parameters", dict(auth_username="me", auth_password="secret"), ""),
+            ("manual cookie header", dict(headers={"Cookie": "secret"}), ""),
+        ]
+        for name, kwargs, url_creds in test_cases:
+            with self.subTest(name=name, origin="different"):
+                url = self.get_url(
+                    "/redirect?url=%s&status=302" % self.get_url2("/echo_headers")
+                )
+                if url_creds:
+                    # Only add credentials to the outer URL being fetched, not to the
+                    # "url" query parameter (the redirect target), which also starts
+                    # with "http://". Otherwise the redirect's Location header would
+                    # carry its own explicit credentials for the new origin, which
+                    # libcurl legitimately honors instead of stripping.
+                    url = url.replace("http://", "http://%s@" % url_creds, 1)
+                response = self.fetch(url, **kwargs)
+                response.rethrow()
+                echoed_headers = json_decode(response.body)
+                # Confirm that non-auth headers are getting through
+                self.assertIn("User-Agent", echoed_headers)
+                # Auth headers are stripped, however they were set.
+                self.assertNotIn("Authorization", echoed_headers)
+                self.assertNotIn("Cookie", echoed_headers)
+            with self.subTest(name=name, origin="same"):
+                url = self.get_url(
+                    "/redirect?url=%s&status=302" % self.get_url("/echo_headers")
+                )
+                if url_creds:
+                    url = url.replace("http://", "http://%s@" % url_creds, 1)
+                response = self.fetch(url, **kwargs)
+                response.rethrow()
+                echoed_headers = json_decode(response.body)
+                # Confirm that non-auth headers are getting through
+                self.assertIn("User-Agent", echoed_headers)
+                if name == "credentials in URL":
+                    # Some libcurl versions (known regression as of 8.20/8.21,
+                    # still present as of curl's git master) drop credentials
+                    # embedded in the URL across a same-origin redirect whose
+                    # Location header is an absolute URL, even though they
+                    # should be preserved. This isn't a security concern
+                    # (nothing is leaked to another origin), so just don't
+                    # assert on it either way here.
+                    pass
+                else:
+                    # Auth headers are not stripped when the redirect is same-origin.
+                    # Each of our tests uses one of these headers, but not both.
+                    self.assertTrue(
+                        "Authorization" in echoed_headers or "Cookie" in echoed_headers
+                    )
+
+
+class AsyncHTTPClientDefaultsTest(AsyncTestCase):
+    def test_disallowed_in_configure(self):
+        # With configure(), the error is raised when the shared instance
+        # is created, and the failed instance is not cached.
+        saved = AsyncHTTPClient._save_configuration()
+        try:
+            AsyncHTTPClient.configure(None, defaults=dict(auth_username="me"))
+            with self.assertRaises(ValueError):
+                AsyncHTTPClient()
+            self.assertNotIn(self.io_loop, AsyncHTTPClient._async_clients())
+        finally:
+            AsyncHTTPClient._restore_configuration(saved)
 
 
 class RequestProxyTest(unittest.TestCase):
